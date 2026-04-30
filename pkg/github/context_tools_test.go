@@ -10,7 +10,7 @@ import (
 	"github.com/github/github-mcp-server/internal/githubv4mock"
 	"github.com/github/github-mcp-server/internal/toolsnaps"
 	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v79/github"
+	"github.com/google/go-github/v82/github"
 	"github.com/shurcooL/githubv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -96,9 +96,10 @@ func Test_GetMe(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var deps ToolDependencies
 			if tc.clientErr != "" {
-				deps = stubDeps{clientFn: stubClientFnErr(tc.clientErr)}
+				deps = stubDeps{clientFn: stubClientFnErr(tc.clientErr), obsv: stubExporters()}
 			} else {
-				deps = BaseDeps{Client: github.NewClient(tc.mockedClient)}
+				obs := stubExporters()
+				deps = BaseDeps{Client: github.NewClient(tc.mockedClient), Obsv: obs}
 			}
 			handler := serverTool.Handler(deps)
 
@@ -215,7 +216,7 @@ func Test_GetTeams(t *testing.T) {
 	// to ensure each test gets a fresh client
 	gqlClientForTestuser := func() *githubv4.Client {
 		queryStr := "query($login:String!){user(login: $login){organizations(first: 100){nodes{login,teams(first: 100, userLogins: [$login]){nodes{name,slug,description}}}}}}"
-		vars := map[string]interface{}{
+		vars := map[string]any{
 			"login": "testuser",
 		}
 		matcher := githubv4mock.NewQueryMatcher(queryStr, vars, mockTeamsResponse)
@@ -225,7 +226,7 @@ func Test_GetTeams(t *testing.T) {
 
 	gqlClientForSpecificuser := func() *githubv4.Client {
 		queryStr := "query($login:String!){user(login: $login){organizations(first: 100){nodes{login,teams(first: 100, userLogins: [$login]){nodes{name,slug,description}}}}}}"
-		vars := map[string]interface{}{
+		vars := map[string]any{
 			"login": "specificuser",
 		}
 		matcher := githubv4mock.NewQueryMatcher(queryStr, vars, mockTeamsResponse)
@@ -235,7 +236,7 @@ func Test_GetTeams(t *testing.T) {
 
 	gqlClientNoTeams := func() *githubv4.Client {
 		queryStr := "query($login:String!){user(login: $login){organizations(first: 100){nodes{login,teams(first: 100, userLogins: [$login]){nodes{name,slug,description}}}}}}"
-		vars := map[string]interface{}{
+		vars := map[string]any{
 			"login": "testuser",
 		}
 		matcher := githubv4mock.NewQueryMatcher(queryStr, vars, mockNoTeamsResponse)
@@ -304,7 +305,7 @@ func Test_GetTeams(t *testing.T) {
 		{
 			name: "getting client fails",
 			makeDeps: func() ToolDependencies {
-				return stubDeps{clientFn: stubClientFnErr("expected test error")}
+				return stubDeps{clientFn: stubClientFnErr("expected test error"), obsv: stubExporters()}
 			},
 			requestArgs:        map[string]any{},
 			expectToolError:    true,
@@ -315,6 +316,7 @@ func Test_GetTeams(t *testing.T) {
 			makeDeps: func() ToolDependencies {
 				return BaseDeps{
 					Client: github.NewClient(httpClientUserFails()),
+					Obsv:   stubExporters(),
 				}
 			},
 			requestArgs:        map[string]any{},
@@ -327,6 +329,7 @@ func Test_GetTeams(t *testing.T) {
 				return stubDeps{
 					clientFn:    stubClientFnFromHTTP(httpClientWithUser()),
 					gqlClientFn: stubGQLClientFnErr("GraphQL client error"),
+					obsv:        stubExporters(),
 				}
 			},
 			requestArgs:        map[string]any{},
@@ -419,7 +422,7 @@ func Test_GetTeamMembers(t *testing.T) {
 	// Create GQL clients for different test scenarios
 	gqlClientWithMembers := func() *githubv4.Client {
 		queryStr := "query($org:String!$teamSlug:String!){organization(login: $org){team(slug: $teamSlug){members(first: 100){nodes{login}}}}}"
-		vars := map[string]interface{}{
+		vars := map[string]any{
 			"org":      "testorg",
 			"teamSlug": "testteam",
 		}
@@ -430,7 +433,7 @@ func Test_GetTeamMembers(t *testing.T) {
 
 	gqlClientNoMembers := func() *githubv4.Client {
 		queryStr := "query($org:String!$teamSlug:String!){organization(login: $org){team(slug: $teamSlug){members(first: 100){nodes{login}}}}}"
-		vars := map[string]interface{}{
+		vars := map[string]any{
 			"org":      "testorg",
 			"teamSlug": "emptyteam",
 		}
@@ -469,7 +472,7 @@ func Test_GetTeamMembers(t *testing.T) {
 		},
 		{
 			name: "getting GraphQL client fails",
-			deps: stubDeps{gqlClientFn: stubGQLClientFnErr("GraphQL client error")},
+			deps: stubDeps{gqlClientFn: stubGQLClientFnErr("GraphQL client error"), obsv: stubExporters()},
 			requestArgs: map[string]any{
 				"org":       "testorg",
 				"team_slug": "testteam",
