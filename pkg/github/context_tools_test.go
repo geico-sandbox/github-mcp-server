@@ -10,7 +10,7 @@ import (
 	"github.com/github/github-mcp-server/internal/githubv4mock"
 	"github.com/github/github-mcp-server/internal/toolsnaps"
 	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/shurcooL/githubv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -199,7 +199,9 @@ func Test_GetMe_IFC_FeatureFlag(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Equal(t, "trusted", ifcMap["integrity"])
-		assert.Equal(t, "public", ifcMap["confidentiality"])
+		// get_me returns the caller's private repo/gist counts, which are not
+		// part of the public profile, so confidentiality is private.
+		assert.Equal(t, "private", ifcMap["confidentiality"])
 	})
 }
 

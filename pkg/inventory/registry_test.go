@@ -2203,22 +2203,16 @@ func TestCreateExcludeToolsFilter(t *testing.T) {
 
 // captureRegisteredTools mirrors RegisterTools' per-request strip behavior so
 // tests can verify what the wire sees, without requiring tools to have real
-// handlers (RegisterTools panics on tools without HandlerFunc).
+// handlers (RegisterTools panics on tools without HandlerFunc). It delegates
+// to ToolsForRegistration so any future strip added there is picked up
+// automatically.
 func captureRegisteredTools(ctx context.Context, t *testing.T, reg *Inventory) []*mcp.Tool {
 	t.Helper()
-	tools := reg.AvailableTools(ctx)
-	out := make([]*mcp.Tool, 0, len(tools))
-	for i := range tools {
-		toolCopy := tools[i].Tool
+	forReg := reg.ToolsForRegistration(ctx)
+	out := make([]*mcp.Tool, 0, len(forReg))
+	for i := range forReg {
+		toolCopy := forReg[i].Tool
 		out = append(out, &toolCopy)
-	}
-	if shouldStripMCPAppsMetadata(ctx, reg.checkFeatureFlag(ctx, mcpAppsFeatureFlag)) {
-		for _, tt := range out {
-			delete(tt.Meta, "ui")
-			if len(tt.Meta) == 0 {
-				tt.Meta = nil
-			}
-		}
 	}
 	return out
 }
@@ -2272,5 +2266,18 @@ func TestShouldStripMCPAppsMetadata(t *testing.T) {
 			got := shouldStripMCPAppsMetadata(tc.setupCtx(), tc.ffOn)
 			require.Equal(t, tc.want, got)
 		})
+	}
+}
+
+func TestForMCPRequest_PreservesInstructions(t *testing.T) {
+	reg := mustBuild(t, NewBuilder().
+		SetTools([]ServerTool{mockTool("tool1", "repos", true)}).
+		WithToolsets([]string{"all"}).
+		WithServerInstructions())
+	want := reg.Instructions()
+	require.NotEmpty(t, want, "expected base inventory to generate instructions")
+	for _, m := range []string{MCPMethodDiscover, MCPMethodInitialize, MCPMethodToolsList} {
+		require.Equal(t, want, reg.ForMCPRequest(m, "").Instructions(),
+			"instructions must be preserved for %s (server identity)", m)
 	}
 }

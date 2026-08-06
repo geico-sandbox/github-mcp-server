@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
@@ -16,9 +18,10 @@ import (
 	"github.com/github/github-mcp-server/pkg/scopes"
 	"github.com/github/github-mcp-server/pkg/translations"
 	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/shurcooL/githubv4"
 )
 
 func GetCommit(t translations.TranslationHelperFunc) inventory.ServerTool {
@@ -118,13 +121,60 @@ func GetCommit(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// Commit content is reachable from the repo's history; in public
+			// repos anyone can land it via a PR (untrusted), in private repos
+			// only collaborators can (trusted). Confidentiality follows repo
+			// visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelCommitContents)
+			return result, nil, nil
 		},
 	)
 }
 
-// ListCommits creates a tool to get commits of a branch in a repository.
+// ListCommits creates a tool to get the list of commits of a branch in a GitHub
+// repository.
 func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
+	schema := &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"owner": {
+				Type:        "string",
+				Description: "Repository owner",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "Repository name",
+			},
+			"sha": {
+				Type:        "string",
+				Description: "Commit SHA, branch or tag name to list commits of. If not provided, uses the default branch of the repository. If a commit SHA is provided, will list commits up to that SHA.",
+			},
+			"author": {
+				Type:        "string",
+				Description: "Author username or email address to filter commits by",
+			},
+			"path": {
+				Type:        "string",
+				Description: "Only commits containing this file path will be returned",
+			},
+			"since": {
+				Type:        "string",
+				Description: "Only commits after this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
+			},
+			"until": {
+				Type:        "string",
+				Description: "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
+			},
+		},
+		Required: []string{"owner", "repo"},
+	}
+	schema.Properties["fields"] = fieldsSchemaProperty(
+		"Subset of fields to return for each commit. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields, e.g. just 'sha' and 'html_url'.",
+		listCommitsItemFieldEnum,
+	)
+	WithPagination(schema)
+
 	return NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
@@ -134,40 +184,7 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Title:        t("TOOL_LIST_COMMITS_USER_TITLE", "List commits"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: WithPagination(&jsonschema.Schema{
-				Type: "object",
-				Properties: map[string]*jsonschema.Schema{
-					"owner": {
-						Type:        "string",
-						Description: "Repository owner",
-					},
-					"repo": {
-						Type:        "string",
-						Description: "Repository name",
-					},
-					"sha": {
-						Type:        "string",
-						Description: "Commit SHA, branch or tag name to list commits of. If not provided, uses the default branch of the repository. If a commit SHA is provided, will list commits up to that SHA.",
-					},
-					"author": {
-						Type:        "string",
-						Description: "Author username or email address to filter commits by",
-					},
-					"path": {
-						Type:        "string",
-						Description: "Only commits containing this file path will be returned",
-					},
-					"since": {
-						Type:        "string",
-						Description: "Only commits after this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
-					},
-					"until": {
-						Type:        "string",
-						Description: "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)",
-					},
-				},
-				Required: []string{"owner", "repo"},
-			}),
+			InputSchema: schema,
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -188,6 +205,10 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			path, err := OptionalParam[string](args, "path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -260,12 +281,30 @@ func ListCommits(t translations.TranslationHelperFunc) inventory.ServerTool {
 				minimalCommits[i] = convertToMinimalCommit(commit, commitDetailNone)
 			}
 
-			r, err := json.Marshal(minimalCommits)
+			filtered := false
+			var payload any = minimalCommits
+			if len(fields) > 0 {
+				filteredCommits, err := filterEachField(minimalCommits, fields)
+				if err != nil {
+					return utils.NewToolResultErrorFromErr("failed to filter commits", err), nil, nil
+				}
+				payload = filteredCommits
+				filtered = true
+			}
+
+			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			recordFieldsUsageFor(ctx, deps, "list_commits", minimalCommits, filtered, len(r))
+
+			result := utils.NewToolResultText(string(r))
+			// Commit content is reachable from the repo's history; integrity
+			// follows the same public-untrusted / private-trusted rule as file
+			// contents. Confidentiality follows repo visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelCommitContents)
+			return result, nil, nil
 		},
 	)
 }
@@ -352,7 +391,12 @@ func ListBranches(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// Branches are structural repo metadata that only collaborators
+			// with push access can create, so integrity is trusted.
+			// Confidentiality follows repo visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelRepoMetadata)
+			return result, nil, nil
 		},
 	)
 }
@@ -392,7 +436,7 @@ SHA MUST be provided for existing file updates.
 					},
 					"content": {
 						Type:        "string",
-						Description: "Content of the file",
+						Description: "Content of the file, exactly as it should appear once written. Do not base64-encode it; this server does that before calling the REST API.",
 					},
 					"message": {
 						Type:        "string",
@@ -581,7 +625,8 @@ func CreateRepository(t translations.TranslationHelperFunc) inventory.ServerTool
 					},
 					"private": {
 						Type:        "boolean",
-						Description: "Whether repo should be private",
+						Description: "Whether the repository should be private. Defaults to true (private) when omitted.",
+						Default:     json.RawMessage("true"),
 					},
 					"autoInit": {
 						Type:        "boolean",
@@ -605,7 +650,7 @@ func CreateRepository(t translations.TranslationHelperFunc) inventory.ServerTool
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			private, err := OptionalParam[bool](args, "private")
+			private, err := OptionalBoolParamWithDefault(args, "private", true)
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -673,8 +718,41 @@ func FetchRepoIsPrivate(ctx context.Context, client *github.Client, owner, repo 
 	return r.GetPrivate(), nil
 }
 
-// GetFileContents creates a tool to get the contents of a file or directory from a GitHub repository.
+// GetFileContents creates a tool to get the contents of a file or directory from
+// a GitHub repository.
 func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool {
+	schema := &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"owner": {
+				Type:        "string",
+				Description: "Repository owner (username or organization)",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "Repository name",
+			},
+			"path": {
+				Type:        "string",
+				Description: "Path to file/directory",
+				Default:     json.RawMessage(`"/"`),
+			},
+			"ref": {
+				Type:        "string",
+				Description: "Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head`",
+			},
+			"sha": {
+				Type:        "string",
+				Description: "Accepts optional commit SHA. If specified, it will be used instead of ref",
+			},
+		},
+		Required: []string{"owner", "repo"},
+	}
+	schema.Properties["fields"] = fieldsSchemaProperty(
+		"Subset of fields to return for each entry when the path is a directory. If omitted, all fields are returned. Ignored when the path is a single file. Use this to reduce response size when listing directories and you only need specific fields, e.g. just 'name' and 'type'.",
+		fileContentFieldEnum,
+	)
+
 	return NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
@@ -684,33 +762,7 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 				Title:        t("TOOL_GET_FILE_CONTENTS_USER_TITLE", "Get file or directory contents"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: &jsonschema.Schema{
-				Type: "object",
-				Properties: map[string]*jsonschema.Schema{
-					"owner": {
-						Type:        "string",
-						Description: "Repository owner (username or organization)",
-					},
-					"repo": {
-						Type:        "string",
-						Description: "Repository name",
-					},
-					"path": {
-						Type:        "string",
-						Description: "Path to file/directory",
-						Default:     json.RawMessage(`"/"`),
-					},
-					"ref": {
-						Type:        "string",
-						Description: "Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head`",
-					},
-					"sha": {
-						Type:        "string",
-						Description: "Accepts optional commit SHA. If specified, it will be used instead of ref",
-					},
-				},
-				Required: []string{"owner", "repo"},
-			},
+			InputSchema: schema,
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -740,6 +792,11 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 
+			fields, err := OptionalStringArrayParam(args, "fields")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
 			client, err := deps.GetClient(ctx)
 			if err != nil {
 				return utils.NewToolResultError("failed to get GitHub client"), nil, nil
@@ -752,28 +809,7 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 			// each. If the visibility lookup fails we skip the label rather
 			// than misclassify the result; the failure is not cached so a
 			// later return path can retry.
-			var (
-				ifcLabelKnown bool
-				ifcIsPrivate  bool
-			)
-			attachIFC := func(r *mcp.CallToolResult) *mcp.CallToolResult {
-				if r == nil || r.IsError || !deps.IsFeatureEnabled(ctx, FeatureFlagIFCLabels) {
-					return r
-				}
-				if !ifcLabelKnown {
-					isPrivate, err := FetchRepoIsPrivate(ctx, client, owner, repo)
-					if err != nil {
-						return r
-					}
-					ifcIsPrivate = isPrivate
-					ifcLabelKnown = true
-				}
-				if r.Meta == nil {
-					r.Meta = mcp.Meta{}
-				}
-				r.Meta["ifc"] = ifc.LabelGetFileContents(ifcIsPrivate)
-				return r
-			}
+			attachIFC := newRepoVisibilityIFCLabeler(ctx, deps, client, owner, repo, ifc.LabelGetFileContents)
 
 			rawOpts, fallbackUsed, err := resolveGitReference(ctx, client, owner, repo, ref, sha)
 			if err != nil {
@@ -884,16 +920,33 @@ func GetFileContents(t translations.TranslationHelperFunc) inventory.ServerTool 
 				return attachIFC(utils.NewToolResultResource(fmt.Sprintf("successfully downloaded binary file (SHA: %s)%s", fileSHA, successNote), result)), nil, nil
 			} else if dirContent != nil {
 				// file content or file SHA is nil which means it's a directory
-				r, err := json.Marshal(dirContent)
+				filtered := false
+				var payload any = dirContent
+				if len(fields) > 0 {
+					filteredEntries, err := filterEachField(dirContent, fields)
+					if err != nil {
+						return utils.NewToolResultErrorFromErr("failed to filter directory contents", err), nil, nil
+					}
+					payload = filteredEntries
+					filtered = true
+				}
+				r, err := json.Marshal(payload)
 				if err != nil {
 					return utils.NewToolResultError("failed to marshal response"), nil, nil
 				}
+				recordDirContentsFieldsUsage(ctx, deps, dirContent, filtered, len(r))
 				return attachIFC(utils.NewToolResultText(string(r))), nil, nil
 			}
 
 			return utils.NewToolResultError("failed to get file contents"), nil, nil
 		},
 	)
+}
+
+// recordDirContentsFieldsUsage emits fields telemetry for a get_file_contents
+// directory listing. sentBytes is the size of the payload actually returned.
+func recordDirContentsFieldsUsage(ctx context.Context, deps ToolDependencies, full []*github.RepositoryContent, filtered bool, sentBytes int) {
+	recordFieldsUsageFor(ctx, deps, "get_file_contents", full, filtered, sentBytes)
 }
 
 // ForkRepository creates a tool to fork a repository.
@@ -1609,7 +1662,12 @@ func ListTags(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// Tags are structural repo metadata created by collaborators with
+			// push access, so integrity is trusted. Confidentiality follows
+			// repo visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelRepoMetadata)
+			return result, nil, nil
 		},
 	)
 }
@@ -1689,7 +1747,9 @@ func GetTag(t translations.TranslationHelperFunc) inventory.ServerTool {
 				if err != nil {
 					return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 				}
-				return utils.NewToolResultText(string(r)), nil, nil
+				result := utils.NewToolResultText(string(r))
+				result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelRepoMetadata)
+				return result, nil, nil
 			}
 
 			tagObj, resp, err := client.Git.GetTag(ctx, owner, repo, *ref.Object.SHA)
@@ -1715,13 +1775,38 @@ func GetTag(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// An annotated tag object is structural repo metadata created by a
+			// collaborator with push access. Confidentiality follows repo
+			// visibility.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result, ifc.LabelRepoMetadata)
+			return result, nil, nil
 		},
 	)
 }
 
 // ListReleases creates a tool to list releases in a GitHub repository.
 func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
+	schema := &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"owner": {
+				Type:        "string",
+				Description: "Repository owner",
+			},
+			"repo": {
+				Type:        "string",
+				Description: "Repository name",
+			},
+		},
+		Required: []string{"owner", "repo"},
+	}
+	schema.Properties["fields"] = fieldsSchemaProperty(
+		"Subset of fields to return for each release. If omitted, all fields are returned. Use this to reduce response size when you only need specific fields; omitting 'body' in particular drops the largest per-release data.",
+		listReleasesItemFieldEnum,
+	)
+	WithPagination(schema)
+
 	return NewTool(
 		ToolsetMetadataRepos,
 		mcp.Tool{
@@ -1731,20 +1816,7 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 				Title:        t("TOOL_LIST_RELEASES_USER_TITLE", "List releases"),
 				ReadOnlyHint: true,
 			},
-			InputSchema: WithPagination(&jsonschema.Schema{
-				Type: "object",
-				Properties: map[string]*jsonschema.Schema{
-					"owner": {
-						Type:        "string",
-						Description: "Repository owner",
-					},
-					"repo": {
-						Type:        "string",
-						Description: "Repository name",
-					},
-				},
-				Required: []string{"owner", "repo"},
-			}),
+			InputSchema: schema,
 		},
 		[]scopes.Scope{scopes.Repo},
 		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
@@ -1753,6 +1825,10 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
 			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			fields, err := OptionalStringArrayParam(args, "fields")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
 			}
@@ -1792,12 +1868,42 @@ func ListReleases(t translations.TranslationHelperFunc) inventory.ServerTool {
 				}
 			}
 
-			r, err := json.Marshal(minimalReleases)
+			filtered := false
+			var payload any = minimalReleases
+			if len(fields) > 0 {
+				filteredReleases, err := filterEachField(minimalReleases, fields)
+				if err != nil {
+					return utils.NewToolResultErrorFromErr("failed to filter releases", err), nil, nil
+				}
+				payload = filteredReleases
+				filtered = true
+			}
+
+			r, err := json.Marshal(payload)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			recordFieldsUsageFor(ctx, deps, "list_releases", minimalReleases, filtered, len(r))
+
+			result := utils.NewToolResultText(string(r))
+			// Releases are published by collaborators with push access, so
+			// integrity is trusted. Confidentiality follows repo visibility,
+			// but draft releases are visible only to push-access users and are
+			// not world-readable even on a public repo, so the result is only
+			// public when no returned release is a draft.
+			hasDraft := false
+			for _, mr := range minimalReleases {
+				if mr.Draft {
+					hasDraft = true
+					break
+				}
+			}
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result,
+				func(isPrivate bool) ifc.SecurityLabel {
+					return ifc.LabelRelease(isPrivate, hasDraft)
+				})
+			return result, nil, nil
 		},
 	)
 }
@@ -1863,7 +1969,16 @@ func GetLatestRelease(t translations.TranslationHelperFunc) inventory.ServerTool
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// Releases are published by collaborators with push access, so
+			// integrity is trusted. The "latest release" endpoint never returns
+			// a draft, but the draft flag is honored defensively: a draft is
+			// not world-readable even on a public repo.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result,
+				func(isPrivate bool) ifc.SecurityLabel {
+					return ifc.LabelRelease(isPrivate, release.GetDraft())
+				})
+			return result, nil, nil
 		},
 	)
 }
@@ -1940,7 +2055,16 @@ func GetReleaseByTag(t translations.TranslationHelperFunc) inventory.ServerTool 
 				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// Releases are published by collaborators with push access, so
+			// integrity is trusted. A release fetched by tag may be a draft,
+			// which is visible only to push-access users and not world-readable
+			// even on a public repo, so a draft forces private confidentiality.
+			result = attachRepoVisibilityIFCLabel(ctx, deps, client, owner, repo, result,
+				func(isPrivate bool) ifc.SecurityLabel {
+					return ifc.LabelRelease(isPrivate, release.GetDraft())
+				})
+			return result, nil, nil
 		},
 	)
 }
@@ -2072,7 +2196,19 @@ func ListStarredRepositories(t translations.TranslationHelperFunc) inventory.Ser
 				return nil, nil, fmt.Errorf("failed to marshal starred repositories: %w", err)
 			}
 
-			return utils.NewToolResultText(string(r)), nil, nil
+			result := utils.NewToolResultText(string(r))
+			// A starred-repository listing exposes repository data across many
+			// repos; reuse the multi-repo join shared with search_repositories
+			// (public-only results stay public-untrusted, mixed-visibility
+			// results become private-untrusted, all-private results become
+			// private-trusted). Visibility is read directly from the response,
+			// so no extra API call is needed.
+			visibilities := make([]bool, 0, len(minimalRepos))
+			for _, mr := range minimalRepos {
+				visibilities = append(visibilities, mr.Private)
+			}
+			result = attachJoinedIFCLabel(ctx, deps, result, visibilities, ifc.LabelSearchIssues)
+			return result, nil, nil
 		},
 	)
 }
@@ -2208,6 +2344,425 @@ func UnstarRepository(t translations.TranslationHelperFunc) inventory.ServerTool
 	)
 }
 
+// maxBlameRanges caps the number of matching blame ranges considered for one response.
+const maxBlameRanges = 1000
+
+const blameCursorPrefix = "blame-range:"
+
+func encodeBlameCursor(offset int) string {
+	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "%s%d", blameCursorPrefix, offset))
+}
+
+func decodeBlameCursor(cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+
+	decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, fmt.Errorf("after cursor is invalid")
+	}
+
+	value := string(decoded)
+	if !strings.HasPrefix(value, blameCursorPrefix) {
+		return 0, fmt.Errorf("after cursor is invalid")
+	}
+
+	offset, err := strconv.Atoi(strings.TrimPrefix(value, blameCursorPrefix))
+	if err != nil || offset < 0 {
+		return 0, fmt.Errorf("after cursor is invalid")
+	}
+
+	return offset, nil
+}
+
+// BlameAuthor describes the author of a commit referenced by a BlameRange.
+type BlameAuthor struct {
+	Name  string  `json:"name"`
+	Email string  `json:"email"`
+	Login *string `json:"login,omitempty"`
+	URL   *string `json:"url,omitempty"`
+}
+
+// BlameCommit holds commit metadata shared by one or more blame ranges.
+type BlameCommit struct {
+	SHA             string      `json:"sha"`
+	MessageHeadline string      `json:"message_headline"`
+	CommittedDate   string      `json:"committed_date"`
+	Author          BlameAuthor `json:"author"`
+}
+
+// BlameRange is a contiguous run of lines attributed to a single commit.
+//
+// Age is the relative position of this range's commit among distinct commits
+// touching the file (0 = newest), not an absolute time delta. See:
+// https://docs.github.com/en/graphql/reference/objects#blamerange
+type BlameRange struct {
+	StartingLine int    `json:"starting_line"`
+	EndingLine   int    `json:"ending_line"`
+	Age          int    `json:"age"`
+	CommitSHA    string `json:"commit_sha"`
+}
+
+// BlameResult is the response payload returned by the get_file_blame tool.
+//
+// Commits is keyed by SHA. TotalRanges counts matching ranges before cursor
+// pagination or truncation. Truncated reports whether maxBlameRanges was hit.
+type BlameResult struct {
+	Repository  string                 `json:"repository"`
+	Path        string                 `json:"path"`
+	Ref         string                 `json:"ref"`
+	Ranges      []BlameRange           `json:"ranges"`
+	Commits     map[string]BlameCommit `json:"commits"`
+	PageInfo    MinimalPageInfo        `json:"pageInfo"`
+	TotalRanges int                    `json:"total_ranges"`
+	Truncated   bool                   `json:"truncated,omitempty"`
+}
+
+// blameCommitFragment is the GraphQL selection for a Commit's blame data.
+type blameCommitFragment struct {
+	Blame struct {
+		Ranges []struct {
+			StartingLine githubv4.Int
+			EndingLine   githubv4.Int
+			Age          githubv4.Int
+			Commit       struct {
+				OID           githubv4.String
+				Message       githubv4.String
+				CommittedDate githubv4.DateTime
+				Author        struct {
+					Name  githubv4.String
+					Email githubv4.String
+					User  *struct {
+						Login githubv4.String
+						URL   githubv4.String
+					}
+				}
+			}
+		}
+	} `graphql:"blame(path: $path)"`
+}
+
+// validateBlamePath rejects empty, leading-slash, traversal-laden, or
+// control-character paths before any network call is made.
+func validateBlamePath(p string) error {
+	if strings.TrimSpace(p) == "" {
+		return fmt.Errorf("path must not be empty")
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("path must be relative to the repository root (no leading '/')")
+	}
+	if slices.Contains(strings.Split(p, "/"), "..") {
+		return fmt.Errorf("path must not contain '..' segments")
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("path must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func GetFileBlame(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := NewTool(
+		ToolsetMetadataRepos,
+		mcp.Tool{
+			Name: "get_file_blame",
+			Description: t("TOOL_GET_FILE_BLAME_DESCRIPTION",
+				"Get git blame information for a file, showing the commit that last modified each line. "+
+					"Ranges share commit metadata via the top-level 'commits' map keyed by SHA. "+
+					"Use 'start_line'/'end_line' to restrict the result to a window of the file, and "+
+					"'perPage'/'after' to cursor-page through returned ranges. Matching ranges are capped at "+
+					"1000; when the cap is hit 'truncated' is set to true and 'total_ranges' reports the pre-cap match count.",
+			),
+			Annotations: &mcp.ToolAnnotations{
+				Title:        t("TOOL_GET_FILE_BLAME_USER_TITLE", "Get file blame information"),
+				ReadOnlyHint: true,
+			},
+			InputSchema: WithCursorPagination(&jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"path": {
+						Type:        "string",
+						Description: "Path to the file in the repository, relative to the repository root",
+					},
+					"ref": {
+						Type:        "string",
+						Description: "Git reference (branch, tag, or commit SHA). Defaults to the repository's default branch (HEAD).",
+					},
+					"start_line": {
+						Type:        "number",
+						Description: "Optional 1-based starting line of the window of interest. Only ranges overlapping [start_line, end_line] are returned, clamped to the window.",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+					"end_line": {
+						Type:        "number",
+						Description: "Optional 1-based ending line of the window of interest. Must be >= start_line when both are provided.",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+				},
+				Required: []string{"owner", "repo", "path"},
+			}),
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			path, err := RequiredParam[string](args, "path")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if err := validateBlamePath(path); err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			ref, err := OptionalParam[string](args, "ref")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			_, hasStartLine := args["start_line"]
+			startLine, err := OptionalIntParam(args, "start_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if hasStartLine && startLine < 1 {
+				return utils.NewToolResultError("start_line must be omitted or >= 1"), nil, nil
+			}
+			_, hasEndLine := args["end_line"]
+			endLine, err := OptionalIntParam(args, "end_line")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if hasEndLine && endLine < 1 {
+				return utils.NewToolResultError("end_line must be omitted or >= 1"), nil, nil
+			}
+			if hasStartLine && hasEndLine && endLine < startLine {
+				return utils.NewToolResultError("end_line must be >= start_line when both are provided"), nil, nil
+			}
+			if _, hasPage := args["page"]; hasPage {
+				return utils.NewToolResultError("This tool uses cursor-based pagination. Use the 'after' parameter with the 'endCursor' value from the previous response instead of 'page'."), nil, nil
+			}
+			pagination, err := OptionalCursorPaginationParams(args)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if _, hasPerPage := args["perPage"]; hasPerPage {
+				perPage, err := OptionalIntParam(args, "perPage")
+				if err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
+				if perPage < 1 || perPage > 100 {
+					return utils.NewToolResultError("perPage must be between 1 and 100 when provided"), nil, nil
+				}
+				pagination.PerPage = perPage
+			}
+			afterOffset, err := decodeBlameCursor(pagination.After)
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetGQLClient(ctx)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get GitHub GraphQL client: %w", err)
+			}
+
+			// Default to HEAD and fetch defaultBranchRef.name in the same query
+			// so the response can echo a readable ref.
+			refExpression := ref
+			if refExpression == "" {
+				refExpression = "HEAD"
+			}
+
+			var blameQuery struct {
+				Repository struct {
+					DefaultBranchRef struct {
+						Name githubv4.String
+					}
+					Object struct {
+						Typename githubv4.String     `graphql:"__typename"`
+						Commit   blameCommitFragment `graphql:"... on Commit"`
+						// Annotated tag targets are followed one level. Tag-of-tag
+						// chains are not followed and will return an error.
+						Tag struct {
+							Target struct {
+								Typename githubv4.String     `graphql:"__typename"`
+								Commit   blameCommitFragment `graphql:"... on Commit"`
+							}
+						} `graphql:"... on Tag"`
+					} `graphql:"object(expression: $ref)"`
+				} `graphql:"repository(owner: $owner, name: $repo)"`
+			}
+
+			vars := map[string]any{
+				"owner": githubv4.String(owner),
+				"repo":  githubv4.String(repo),
+				"ref":   githubv4.String(refExpression),
+				"path":  githubv4.String(path),
+			}
+
+			if err := client.Query(ctx, &blameQuery, vars); err != nil {
+				return ghErrors.NewGitHubGraphQLErrorResponse(ctx,
+					fmt.Sprintf("failed to get blame for file: %s", path),
+					err,
+				), nil, nil
+			}
+
+			// GitHub's Commit.blame field accepts only path, and Blame.ranges is
+			// not a connection, so cursor pagination is applied locally below.
+			// The ref must resolve to a commit, either directly or via an annotated tag.
+			objectTypename := string(blameQuery.Repository.Object.Typename)
+			if objectTypename == "" {
+				return utils.NewToolResultError(
+					fmt.Sprintf("ref %q was not found in %s/%s", refExpression, owner, repo),
+				), nil, nil
+			}
+			blameCommit := &blameQuery.Repository.Object.Commit
+			if objectTypename == "Tag" {
+				targetTypename := string(blameQuery.Repository.Object.Tag.Target.Typename)
+				if targetTypename != "Commit" {
+					if targetTypename == "" {
+						targetTypename = "unknown"
+					}
+					return utils.NewToolResultError(
+						fmt.Sprintf("ref %q resolved to a tag in %s/%s, but the tag target did not resolve to a commit (resolved to %s)",
+							refExpression, owner, repo, targetTypename),
+					), nil, nil
+				}
+				blameCommit = &blameQuery.Repository.Object.Tag.Target.Commit
+			} else if objectTypename != "Commit" {
+				return utils.NewToolResultError(
+					fmt.Sprintf("ref %q did not resolve to a commit in %s/%s (resolved to %s)",
+						refExpression, owner, repo, objectTypename),
+				), nil, nil
+			}
+
+			// Echo the caller's ref, otherwise prefer the default branch name.
+			responseRef := ref
+			if responseRef == "" {
+				if name := string(blameQuery.Repository.DefaultBranchRef.Name); name != "" {
+					responseRef = name
+				} else {
+					responseRef = refExpression
+				}
+			}
+
+			rawRanges := blameCommit.Blame.Ranges
+			pageRanges := make([]BlameRange, 0, pagination.PerPage)
+			commits := make(map[string]BlameCommit)
+			totalRanges := 0
+			truncated := false
+
+			for _, r := range rawRanges {
+				start := int(r.StartingLine)
+				end := int(r.EndingLine)
+				if startLine > 0 && end < startLine {
+					continue
+				}
+				if endLine > 0 && start > endLine {
+					continue
+				}
+				if startLine > 0 && start < startLine {
+					start = startLine
+				}
+				if endLine > 0 && end > endLine {
+					end = endLine
+				}
+
+				matchIndex := totalRanges
+				totalRanges++
+				if matchIndex >= maxBlameRanges {
+					truncated = true
+					continue
+				}
+				if matchIndex < afterOffset || len(pageRanges) >= pagination.PerPage {
+					continue
+				}
+
+				blameRange := BlameRange{
+					StartingLine: start,
+					EndingLine:   end,
+					Age:          int(r.Age),
+					CommitSHA:    string(r.Commit.OID),
+				}
+				pageRanges = append(pageRanges, blameRange)
+
+				sha := string(r.Commit.OID)
+				if _, seen := commits[sha]; seen {
+					continue
+				}
+				headline := string(r.Commit.Message)
+				if idx := strings.IndexByte(headline, '\n'); idx >= 0 {
+					headline = headline[:idx]
+				}
+				headline = strings.TrimRight(headline, " \t\r")
+				bc := BlameCommit{
+					SHA:             sha,
+					MessageHeadline: headline,
+					CommittedDate:   r.Commit.CommittedDate.Format("2006-01-02T15:04:05Z"),
+					Author: BlameAuthor{
+						Name:  string(r.Commit.Author.Name),
+						Email: string(r.Commit.Author.Email),
+					},
+				}
+				if r.Commit.Author.User != nil {
+					login := string(r.Commit.Author.User.Login)
+					url := string(r.Commit.Author.User.URL)
+					bc.Author.Login = &login
+					bc.Author.URL = &url
+				}
+				commits[sha] = bc
+			}
+
+			cappedRanges := min(totalRanges, maxBlameRanges)
+			consumedRanges := min(afterOffset+len(pageRanges), cappedRanges)
+			pageInfo := MinimalPageInfo{
+				HasNextPage:     consumedRanges < cappedRanges,
+				HasPreviousPage: afterOffset > 0,
+			}
+			if len(pageRanges) > 0 {
+				pageInfo.StartCursor = encodeBlameCursor(afterOffset)
+				pageInfo.EndCursor = encodeBlameCursor(consumedRanges)
+			}
+
+			result := BlameResult{
+				Repository:  fmt.Sprintf("%s/%s", owner, repo),
+				Path:        path,
+				Ref:         responseRef,
+				Ranges:      pageRanges,
+				Commits:     commits,
+				PageInfo:    pageInfo,
+				TotalRanges: totalRanges,
+				Truncated:   truncated,
+			}
+			if result.Ranges == nil {
+				result.Ranges = []BlameRange{}
+			}
+
+			payload, err := json.Marshal(result)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return utils.NewToolResultText(string(payload)), nil, nil
+		},
+	)
+	st.FeatureFlagEnable = FeatureFlagFileBlame
+	return st
+}
+
 // ListRepositoryCollaborators creates a tool to list collaborators of a GitHub repository.
 func ListRepositoryCollaborators(t translations.TranslationHelperFunc) inventory.ServerTool {
 	return NewTool(
@@ -2311,7 +2866,13 @@ func ListRepositoryCollaborators(t translations.TranslationHelperFunc) inventory
 				"lastPage":  resp.LastPage,
 			}
 
-			return MarshalledTextResult(response), nil, nil
+			callResult := MarshalledTextResult(response)
+			// The collaborator roster is GitHub-maintained membership data
+			// (trusted, not attacker-authored). Listing collaborators requires
+			// push access, so the roster is never world-readable — not even on
+			// a public repo — hence always private confidentiality.
+			callResult = attachStaticIFCLabel(ctx, deps, callResult, ifc.LabelCollaboratorRoster())
+			return callResult, nil, nil
 		},
 	)
 }
