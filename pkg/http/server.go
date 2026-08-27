@@ -53,6 +53,13 @@ type ServerConfig struct {
 	// This is used to restore the original path when a proxy strips a base path before forwarding.
 	ResourcePath string
 
+	// AuthorizationServer overrides the authorization server URL advertised in the
+	// OAuth Protected Resource Metadata (/.well-known/oauth-protected-resource).
+	// When set, this URL is used instead of the one derived from the GitHub host.
+	// Useful when deploying behind an OAuth proxy (e.g. for GHES, which does not
+	// natively support RFC 8414 / RFC 7591 / PKCE).
+	AuthorizationServer string
+
 	// TrustProxyHeaders indicates whether X-Forwarded-Host and X-Forwarded-Proto
 	// should be honored when constructing OAuth resource metadata URLs. Only
 	// enable this when the server is deployed behind a trusted proxy that sets
@@ -190,39 +197,29 @@ func RunHTTPServer(cfg ServerConfig) error {
 	}
 
 	// Register OAuth protected resource metadata endpoints
-	oauthCfg := &oauth.Config{
-		BaseURL:           cfg.BaseURL,
-		ResourcePath:      cfg.ResourcePath,
-		TrustProxyHeaders: cfg.TrustProxyHeaders,
-	}
+	oauthCfg := newOAuthConfig(cfg)
 
 	serverOptions := []HandlerOption{
 		WithInventoryFactory(inventoryFactory),
 		WithScopeFetcher(scopeFetcher),
 	}
 
-	r := chi.NewRouter()
 	handler := NewHTTPMcpHandler(ctx, &cfg, deps, t, logger, apiHost, append(serverOptions, WithFeatureChecker(featureChecker), WithOAuthConfig(oauthCfg))...)
 	oauthHandler, err := oauth.NewAuthHandler(oauthCfg, apiHost)
 	if err != nil {
 		return fmt.Errorf("failed to create OAuth handler: %w", err)
 	}
 
-	r.Group(func(r chi.Router) {
-		r.Use(middleware.SetCorsHeaders)
-
-		// Register Middleware First, needs to be before route registration
-		handler.RegisterMiddleware(r)
-
-		// Register MCP server routes
-		handler.RegisterRoutes(r)
-	})
+	r := newHTTPRouter(
+		func(r chi.Router) {
+			// Register Middleware First, needs to be before route registration
+			handler.RegisterMiddleware(r)
+			// Register MCP server routes
+			handler.RegisterRoutes(r)
+		},
+		oauthHandler.RegisterRoutes,
+	)
 	logger.Info("MCP endpoints registered", "baseURL", cfg.BaseURL)
-
-	r.Group(func(r chi.Router) {
-		// Register OAuth protected resource metadata endpoints
-		oauthHandler.RegisterRoutes(r)
-	})
 	logger.Info("OAuth protected resource endpoints registered", "baseURL", cfg.BaseURL)
 
 	addr := resolveListenAddress(cfg.ListenHost, cfg.Port)
@@ -254,6 +251,23 @@ func RunHTTPServer(cfg ServerConfig) error {
 
 	logger.Info("server stopped gracefully")
 	return nil
+}
+
+func newHTTPRouter(registerMCPRoutes, registerOAuthRoutes func(chi.Router)) chi.Router {
+	r := chi.NewRouter()
+	r.Use(middleware.SetCorsHeaders)
+	r.Group(registerMCPRoutes)
+	r.Group(registerOAuthRoutes)
+	return r
+}
+
+func newOAuthConfig(cfg ServerConfig) *oauth.Config {
+	return &oauth.Config{
+		BaseURL:             cfg.BaseURL,
+		ResourcePath:        cfg.ResourcePath,
+		TrustProxyHeaders:   cfg.TrustProxyHeaders,
+		AuthorizationServer: cfg.AuthorizationServer,
+	}
 }
 
 // resolveListenAddress returns the address string passed to http.Server.

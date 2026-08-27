@@ -1,10 +1,12 @@
 package oauth
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/github/github-mcp-server/pkg/http/headers"
@@ -17,6 +19,16 @@ import (
 var (
 	defaultAuthorizationServer = "https://github.com/login/oauth"
 )
+
+type countingAPIHostResolver struct {
+	utils.APIHostResolver
+	authorizationServerURLCalls int
+}
+
+func (r *countingAPIHostResolver) AuthorizationServerURL(ctx context.Context) (*url.URL, error) {
+	r.authorizationServerURLCalls++
+	return r.APIHostResolver.AuthorizationServerURL(ctx)
+}
 
 func TestNewAuthHandler(t *testing.T) {
 	t.Parallel()
@@ -530,37 +542,42 @@ func TestRegisterRoutes(t *testing.T) {
 	router := chi.NewRouter()
 	handler.RegisterRoutes(router)
 
-	// List of expected routes that should be registered
-	expectedRoutes := []string{
-		OAuthProtectedResourcePrefix,
-		OAuthProtectedResourcePrefix + "/",
-		OAuthProtectedResourcePrefix + "/mcp",
-		OAuthProtectedResourcePrefix + "/mcp/",
-		OAuthProtectedResourcePrefix + "/readonly",
-		OAuthProtectedResourcePrefix + "/readonly/",
-		OAuthProtectedResourcePrefix + "/mcp/readonly",
-		OAuthProtectedResourcePrefix + "/mcp/readonly/",
-		OAuthProtectedResourcePrefix + "/x/repos",
-		OAuthProtectedResourcePrefix + "/mcp/x/repos",
+	resourcePaths := []string{
+		"",
+		"/readonly",
+		"/insiders",
+		"/readonly/insiders",
+		"/x/repos",
+		"/x/repos/readonly",
+		"/x/repos/insiders",
+		"/x/repos/readonly/insiders",
 	}
 
-	for _, route := range expectedRoutes {
-		t.Run("route:"+route, func(t *testing.T) {
-			// Test GET
-			req := httptest.NewRequest(http.MethodGet, route, nil)
-			req.Host = "api.example.com"
-			rec := httptest.NewRecorder()
-			router.ServeHTTP(rec, req)
-			assert.Equal(t, http.StatusOK, rec.Code, "GET %s should return 200", route)
+	for _, basePath := range []string{"", "/mcp"} {
+		for _, resourcePath := range resourcePaths {
+			for _, trailingSlash := range []string{"", "/"} {
+				route := OAuthProtectedResourcePrefix + basePath + resourcePath + trailingSlash
+				t.Run("route:"+route, func(t *testing.T) {
+					req := httptest.NewRequest(http.MethodGet, route, nil)
+					req.Host = "api.example.com"
+					rec := httptest.NewRecorder()
+					router.ServeHTTP(rec, req)
+					assert.Equal(t, http.StatusOK, rec.Code, "GET %s should return 200", route)
 
-			// Test OPTIONS (CORS preflight)
-			req = httptest.NewRequest(http.MethodOptions, route, nil)
-			req.Host = "api.example.com"
-			rec = httptest.NewRecorder()
-			router.ServeHTTP(rec, req)
-			assert.Equal(t, http.StatusNoContent, rec.Code, "OPTIONS %s should return 204", route)
-		})
+					req = httptest.NewRequest(http.MethodOptions, route, nil)
+					req.Host = "api.example.com"
+					rec = httptest.NewRecorder()
+					router.ServeHTTP(rec, req)
+					assert.Equal(t, http.StatusNoContent, rec.Code, "OPTIONS %s should return 204", route)
+				})
+			}
+		}
 	}
+
+	req := httptest.NewRequest(http.MethodGet, OAuthProtectedResourcePrefix+"/mcp/unknown", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestSupportedScopes(t *testing.T) {
@@ -729,6 +746,7 @@ func TestAPIHostResolver_AuthorizationServerURL(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			countingAPIHost := &countingAPIHostResolver{APIHostResolver: apiHost}
 
 			config := tc.oauthConfig
 			if config == nil {
@@ -736,7 +754,7 @@ func TestAPIHostResolver_AuthorizationServerURL(t *testing.T) {
 			}
 			config.BaseURL = tc.host
 
-			handler, err := NewAuthHandler(config, apiHost)
+			handler, err := NewAuthHandler(config, countingAPIHost)
 			require.NoError(t, err)
 
 			router := chi.NewRouter()
@@ -767,6 +785,11 @@ func TestAPIHostResolver_AuthorizationServerURL(t *testing.T) {
 			require.True(t, ok)
 			require.Len(t, responseAuthServers, 1)
 			assert.Equal(t, tc.expectedURL, responseAuthServers[0])
+			if config.AuthorizationServer == "" {
+				assert.Equal(t, 1, countingAPIHost.authorizationServerURLCalls)
+			} else {
+				assert.Zero(t, countingAPIHost.authorizationServerURLCalls)
+			}
 		})
 	}
 }
